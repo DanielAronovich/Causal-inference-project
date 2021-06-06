@@ -1,100 +1,69 @@
 import pandas as pd
-from estimators import IPW, CovariateAdjustment, Matching
+
+from read_NSDUH import Read, Codes
+from estimators_ATE import IPW, CovariateAdjustment, Matching
 from sklearn.metrics.pairwise import euclidean_distances, manhattan_distances
 from distance_functions import hamming_distance
-import numpy as np
+from read_NSDUH import Codes
 
-def preprocess_data(data: pd.DataFrame):
-    # Remove sample id column
-    data.drop(columns='Unnamed: 0', inplace=True)
-    # categorize features
-    data = pd.get_dummies(data)
-    y = data['Y']
-    x = data.loc[:, data.columns != 'Y']
-    return x, y
-
+OVERLAP_PCT = .95
 
 if __name__ == "__main__":
 
     propList = []
     attList = []
-    for data in ["data1.csv", "data2.csv"]:
+    results = []
+    for year in ["2017", "2018", "2019"]:
+        file = f"NSDUH_{year}.parquet"
+        reader = Read(file_path=file)
+        data = reader.read().loc[:, :].reset_index(drop=True)
 
+        x = data.loc[:, ~data.columns.isin(Codes.outcomes.values())]
+        ipw = IPW(x=x)
+        p_scores = pd.DataFrame(ipw.p_scores)
+        only_overlapped_data = p_scores[(p_scores[0] < OVERLAP_PCT) & (p_scores[1] < OVERLAP_PCT)]
 
-        print(" ----------  Working on", data)
-        att = []
-        data1 = pd.read_csv(data)
-        x1, y1 = preprocess_data(data1)
+        x1 = x.loc[only_overlapped_data.index]
+        y = data.loc[only_overlapped_data.index]
 
+        unfiltered_methods = [
+            # Matching(hamming_distance, list(set(x1.columns) - set(Codes.non_psy_drugs.values()) - set(['T']))),
+            # Matching(hamming_distance, Codes.non_psy_drugs.values()),
+            Matching(hamming_distance)
 
+        ]
+        filtered_methods = [
+            CovariateAdjustment(learner='s'),
+            CovariateAdjustment(learner='t'),
+        ]
 
-        # ------ IPW calculation -------------
-        l = IPW()
-        attIPW1, propScore = l.estimate(x1, y1)
-        print(f"{l.name}: {attIPW1}")
-        # print(propScore[:,0])
-        propList.append([data] + list(propScore[:,0]))
-        att.append(attIPW1)
+        T1_overlap = x1[x1['T'] == 1].shape[0]
+        T0_overlap = x1[x1['T'] == 0].shape[0]
 
-        # ------ S learner calculation -------------
+        T1_matching = x[x['T'] == 1].shape[0]
+        T0_matching = x[x['T'] == 0].shape[0]
 
-        l = CovariateAdjustment(learner='s')
-        attS = l.estimate(x1, y1)
-        print(f"{l.name}: {attS}")
-        att.append(attS)
+        for outcome in Codes.outcomes.values():
+            print(f"------{outcome}------")
+            y1 = y[outcome]
+            for method in filtered_methods:
+                mean, std = method.estimate(x1, y1)
+                results.append([method.name, mean, std, T1_overlap, T0_overlap, year])
+                print({method.name: {
+                    "mean": round(mean, 3),
+                    "std": round(std, 3)
+                }})
 
+            x0 = x
+            y0 = data[outcome]
+            for method in unfiltered_methods:
+                mean, std = method.estimate(x0, y0)
+                results.append([method.name, mean, std, T1_matching, T0_matching, year])
+                print({method.name: {
+                    "mean": round(mean, 3),
+                    "std": round(std, 3)
+                }})
 
-        # ------ T learner calculation -------------
-
-        l = CovariateAdjustment(learner='t')
-        attT = l.estimate(x1, y1)
-        print(f"{l.name}: {attT}")
-        att.append(attT)
-
-
-        # ------ Matching calculation  -------------
-
-        l = Matching(euclidean_distances)
-        attME = l.estimate(x1, y1)
-        print(f"{l.name}: {attME}")
-        att.append(attME)
-
-
-        l = Matching(manhattan_distances)
-        attM = l.estimate(x1, y1)
-        print(f"{l.name}: {attM}")
-
-        l = Matching(hamming_distance)
-        attH = l.estimate(x1, y1)
-        print(f"{l.name}: {attH}")
-
-        # ------ best estimate of ATT via averaging -------------
-
-        IPWavg = []
-        for k in range(0,30):
-            l = IPW()
-            attBest, propScore = l.estimate(x1, y1)
-            IPWavg.append(attBest)
-
-        IPWavg= np.asarray(IPWavg).mean()
-        attBest = np.asarray([IPWavg,attS,attT,attM,attH,attME]).mean()
-        print("best ATT",attBest)
-        att.append(attBest)
-
-        attList.append(att)
-
-
-
-    # ------ save all the results -------------
-
-    propList = pd.DataFrame(propList)
-    propList.to_csv("models_propensity.csv", header=False, index=False)
-
-    attList = pd.DataFrame(attList).T
-    attList.columns = ['data1','data2']
-    type = [1, 2, 3, 4, 5]
-    attList.insert(loc=0, column='Type', value=type)
-    print (attList)
-    attList.to_csv("ATT_results.csv",index=False)
-
-
+            print(f"---------------------------")
+    results = pd.DataFrame(results, columns=["Estimator", "Mean", "STD", "T1", "T0", "Year"])
+    results.to_csv(f"results.csv")
